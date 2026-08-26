@@ -99,25 +99,27 @@
           <span v-if="sysConfig.show_tf && server.traffic_limit" class="stat-limit">/ 📦 {{ formatBytes(server.traffic_limit * 1024 * 1024 * 1024) }}</span>
         </div>
       </div>
-      <div v-if="sysConfig.show_time" class="stat-row stat-time-row">
-        <span class="stat-key">TIME</span>
-        <div class="stat-content stat-content-time">
-          <span class="stat-time-value">{{ dataTimeText }}</span>
-        </div>
-      </div>
     </div>
     <div class="server-space"></div>
-    <div v-if="hasPingData" class="ping-panel">
-      <div class="ping-item" v-for="p in pingList" :key="p.label">
-        <span class="ping-label">{{ p.label }}</span>
-        <span class="ping-value" :style="{ color: getPingColor(p.value) }">{{ !isPingValid(p.value) ? trans.timeout : p.value + 'ms' }}</span>
-      </div>
-    </div>
+    <ServerLatencyPanel
+      :show-three-net-details="sysConfig.show_three_net_details"
+      :has-three-net-details="hasThreeNetDetails"
+      :three-net-details="threeNetDetails"
+      :has-ping-data="hasPingData"
+      :ping-list="pingList"
+      :timeout-text="trans.timeout"
+      :get-ping-color="getPingColor"
+      :get-loss-color="getLossColor"
+      :format-ping-value="formatPingValue"
+      :format-loss-value="formatLossValue"
+      :is-ping-valid="isPingValid"
+    />
   </router-link>
 </template>
 
 <script setup>
 import OsIcon from './OsIcon.vue'
+import ServerLatencyPanel from './ServerLatencyPanel.vue'
 import { DEFAULT_SERVER_CARD_CONFIG, useServerCardData } from '../composables/useServerCardData'
 
 const props = defineProps({
@@ -157,13 +159,17 @@ const {
   priceText,
   expireDateTitle,
   loadAvg,
-  dataTimeText,
   isExpired,
   expireText,
   isPingValid,
   getPingColor,
+  getLossColor,
+  formatPingValue,
+  formatLossValue,
   pingList,
   hasPingData,
+  threeNetDetails,
+  hasThreeNetDetails,
   getPublicAssetUrl,
   formatBytes
 } = useServerCardData(props)

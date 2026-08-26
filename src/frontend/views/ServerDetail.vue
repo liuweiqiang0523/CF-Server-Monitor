@@ -338,16 +338,24 @@
         </div>
       </div>
     </div>
+
+    <LiveConnectionTimeoutModal
+      :show="showLiveTimeoutModal"
+      :trans="trans"
+      @close="closeLiveConnection"
+      @continue="continueLiveConnection"
+    />
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted, watch, nextTick, h } from 'vue'
+import { ref, computed, inject, onMounted, onUnmounted, watch, nextTick, h } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import TerminalHeader from '../components/TerminalHeader.vue'
 import Footer from '../components/Footer.vue'
 import OsIcon from '../components/OsIcon.vue'
-import { fetchServerDetail, fetchAllHistory, fetchConfig, formatBytes, isAdminLoggedIn, createLiveSocket, getFlagRegionCode, isServerOnline } from '../utils/api.js'
+import LiveConnectionTimeoutModal from '../components/LiveConnectionTimeoutModal.vue'
+import { fetchServerDetail, fetchAllHistory, fetchConfig, formatBytes, isAdminLoggedIn, createLiveSocket, getFlagRegionCode, isServerOnline, normalizeLiveSocketTimeoutMinutes } from '../utils/api.js'
 import { getTrafficUsageBytes } from '../composables/useServerCardData'
 import { getPublicAssetUrl } from '../utils/config.js'
 import Chart from 'chart.js/auto'
@@ -362,6 +370,7 @@ import { applyMikusThemeOptions } from '../utils/themeOptions.js'
 
 const route = useRoute()
 const router = useRouter()
+const appConfig = inject('appConfig', null)
 
 let serverId = route.params.id
 if (!serverId) {
@@ -386,6 +395,8 @@ const currentHours = ref(REALTIME_HISTORY_HOURS)
 const lastUpdateText = ref('')
 const config = ref(null)
 const showLoginModal = ref(false)
+const showLiveTimeoutModal = ref(false)
+const frontendWsTimeoutMinutes = ref(0)
 const loading = ref(true)
 
 const trans = useTranslation()
@@ -809,8 +820,8 @@ const CHART_DEFS = [
   { key: 'proc', ref: () => procChartRef.value, datasets: [ds('Processes', '#f778ba', { fill: true })] },
   { key: 'net', ref: () => netChartRef.value, datasets: [ds('Download', '#00d4aa', { fill: true }), ds('Upload', '#4da6ff', { fill: true })], legend: true, formatValue: (v) => formatBytes(v) + '/s', tickFormat: (v) => formatBytes(v) },
   { key: 'conn', ref: () => connChartRef.value, datasets: [ds('TCP', '#b392f0'), ds('UDP', '#f778ba')], legend: true },
-  { key: 'ping', ref: () => pingChartRef.value, datasets: [ds('CT', '#00d4aa', { tension: 0.3 }), ds('CU', '#ffb870', { tension: 0.3 }), ds('CM', '#4da6ff', { tension: 0.3 }), ds('BD', '#b392f0', { tension: 0.3 })], unit: ' ms', legend: true },
-  { key: 'loss', ref: () => lossChartRef.value, datasets: [ds('CT', '#00d4aa', { tension: 0.3 }), ds('CU', '#ffb870', { tension: 0.3 }), ds('CM', '#4da6ff', { tension: 0.3 }), ds('BD', '#b392f0', { tension: 0.3 })], unit: '%', legend: true },
+  { key: 'ping', ref: () => pingChartRef.value, datasets: [ds('CT', '#00d4aa', { tension: 0.3 }), ds('CU', '#ffb870', { tension: 0.3 }), ds('CM', '#4da6ff', { tension: 0.3 }), ds('BGP', '#b392f0', { tension: 0.3 })], unit: ' ms', legend: true },
+  { key: 'loss', ref: () => lossChartRef.value, datasets: [ds('CT', '#00d4aa', { tension: 0.3 }), ds('CU', '#ffb870', { tension: 0.3 }), ds('CM', '#4da6ff', { tension: 0.3 }), ds('BGP', '#b392f0', { tension: 0.3 })], unit: '%', legend: true },
   { key: 'load', ref: () => loadChartRef.value, datasets: [ds(trans.value.load1m || '1 Min', '#00d4aa', { tension: 0.3 }), ds(trans.value.load5m || '5 Min', '#ffb870', { tension: 0.3 }), ds(trans.value.load15m || '15 Min', '#4da6ff', { tension: 0.3 })], legend: true }
 ]
 
@@ -1043,14 +1054,15 @@ const updateChartsTheme = () => {
 const { onThemeChange } = useTheme()
 onThemeChange(updateChartsTheme)
 
-// ≤1h: gap超过5分钟断线; >1h: 按后端采样点数计算，最低5分钟基础阈值
+// ≤1h: gap超过5分钟断线; >1h: 按 long_history_points 计算采样间隔，允许点落在桶内不同位置造成的正常漂移
 const getHistoryGapBreakMs = (hours = currentHours.value) => {
   if (hours <= 1) return 5 * 60 * 1000
   const configuredPoints = Number(config.value?.long_history_points)
   const samplePoints = HISTORY.LONG_RANGE_POINT_OPTIONS.includes(configuredPoints)
     ? configuredPoints
     : HISTORY.DEFAULT_LONG_RANGE_POINTS
-  return Math.max(5 * 60 * 1000, Math.ceil(hours * 60 * 60 * 1000 / samplePoints))
+  const expectedIntervalMs = Math.ceil(hours * 60 * 60 * 1000 / samplePoints)
+  return Math.max(5 * 60 * 1000, expectedIntervalMs * 1.9)
 }
 
 const shouldBreakGap = (prevPoint, nextPoint) => {
@@ -1060,8 +1072,7 @@ const shouldBreakGap = (prevPoint, nextPoint) => {
   if (!Number.isFinite(prevTime) || !Number.isFinite(nextTime)) return false
   const gap = nextTime - prevTime
   const breakThreshold = getHistoryGapBreakMs()
-  if (currentHours.value <= 1) return gap > breakThreshold
-  return gap > breakThreshold * 1.1
+  return gap > breakThreshold
 }
 
 const applyGapBreak = (data) => {
@@ -1110,12 +1121,6 @@ const getLastDatasetTimestamp = (data) => {
   return 0
 }
 
-const sampleData = (dataPoints) => {
-  if (!dataPoints || dataPoints.length <= CHART.MAX_DATA_POINTS) return dataPoints
-  const step = Math.ceil(dataPoints.length / CHART.MAX_DATA_POINTS)
-  return dataPoints.filter((_, i) => i % step === 0)
-}
-
 const updateChartDataset = (chart, datasetIndex, dataPoints, yAccessor) => {
   if (!chart) return
 
@@ -1124,9 +1129,7 @@ const updateChartDataset = (chart, datasetIndex, dataPoints, yAccessor) => {
 
   let processedData = []
   if (dataPoints && dataPoints.length > 0) {
-    const sampledData = sampleData(dataPoints)
-
-    processedData = sampledData.map(d => {
+    processedData = dataPoints.map(d => {
       return createChartPoint(new Date(d.timestamp).getTime(), yAccessor(d))
     })
 
@@ -1155,9 +1158,7 @@ const updateLoadChart = (chart, dataPoints) => {
 
   let processedData = []
   if (dataPoints && dataPoints.length > 0) {
-    const sampledData = sampleData(dataPoints)
-
-    processedData = sampledData.map(d => {
+    processedData = dataPoints.map(d => {
       const loadVal = d.load_avg || '0 0 0'
       const loads = parseLoadAvg(loadVal)
       return { 
@@ -1608,6 +1609,7 @@ const goToLogin = () => {
 }
 
 let liveSocket = null
+let liveConnectionClosedByUser = false
 
 const initChartsOnMount = async () => {
   if (isInitializingCharts || chartsReady.value) return
@@ -1636,9 +1638,23 @@ const handleVisibility = () => {
   if (document.hidden) {
     clearLatestReportReplayTimers()
     liveSocket.close()
+  } else if (showLiveTimeoutModal.value || liveConnectionClosedByUser) {
+    return
   } else {
     liveSocket.reconnect()
   }
+}
+
+const closeLiveConnection = () => {
+  showLiveTimeoutModal.value = false
+  liveConnectionClosedByUser = true
+  liveSocket?.close()
+}
+
+const continueLiveConnection = () => {
+  showLiveTimeoutModal.value = false
+  liveConnectionClosedByUser = false
+  liveSocket?.reconnect()
 }
 
 const handleLiveMessage = (msg) => {
@@ -1654,9 +1670,18 @@ const handleLiveMessage = (msg) => {
   }
 }
 
+const getInjectedRuntimeConfig = () => {
+  if (!appConfig) return null
+  if (Array.isArray(appConfig.site_configs) && appConfig.site_configs[apiIndex.value]) {
+    return appConfig.site_configs[apiIndex.value]
+  }
+  return apiIndex.value === 0 ? appConfig : null
+}
+
 const loadThemeOptionsFromConfig = async () => {
   try {
-    const runtimeConfig = await fetchConfig(apiIndex.value)
+    const runtimeConfig = getInjectedRuntimeConfig() || await fetchConfig(apiIndex.value)
+    frontendWsTimeoutMinutes.value = normalizeLiveSocketTimeoutMinutes(runtimeConfig?.frontend_ws_timeout_minutes)
     if (runtimeConfig && Object.prototype.hasOwnProperty.call(runtimeConfig, 'theme_options')) {
       applyMikusThemeOptions(runtimeConfig.theme_options)
     }
@@ -1677,7 +1702,11 @@ const init = async () => {
 
   liveSocket = createLiveSocket(String(serverId), {
     replay: false,
+    timeoutMinutes: frontendWsTimeoutMinutes.value,
     onMessage: handleLiveMessage,
+    onTimeout: () => {
+      showLiveTimeoutModal.value = true
+    },
     onStatus: ({ connected }) => {}
   }, apiIndex.value)
 

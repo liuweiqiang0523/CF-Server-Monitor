@@ -41,33 +41,30 @@
         </div>
 
         <div v-if="deleteVersion === 'go'" class="form-group flex-1 mb-3">
-          <label class="form-label">{{ trans.ghProxy }}</label>
+          <label class="form-label">
+            {{ trans.ghProxy }}
+            <HelpTooltip :text="trans.ghProxyTip" />
+          </label>
+          <select v-model="selectedGhProxy" class="form-select">
+            <option v-for="option in ghProxyOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+            <option :value="CUSTOM_GH_PROXY_VALUE">{{ trans.custom || 'Custom' }}</option>
+          </select>
           <input
+            v-if="showCustomGhProxy"
             type="text"
-            list="deleteGhProxyList"
             :value="deleteGhProxy"
-            class="form-input"
+            class="form-input mt-2"
             :placeholder="trans.ghProxyPlaceholder"
             @input="$emit('update:delete-gh-proxy', $event.target.value)"
           >
-          <datalist id="deleteGhProxyList">
-            <option value="https://gh.llkk.cc/">https://gh.llkk.cc/</option>
-            <option value="https://gh-proxy.com/">https://gh-proxy.com/</option>
-            <option value="https://ghproxy.net/">https://ghproxy.net/</option>
-            <option value="https://ghfast.top/">https://ghfast.top/</option>
-          </datalist>
         </div>
       </div>
 
       <div class="cmd-input-wrapper mb-3" :class="{ copied: uninstallCopied }">
         <span class="cmd-prompt">{{ deleteTargetOs === 'windows' ? 'PS' : '$' }}</span>
         <input type="text" readonly :value="uninstallCommand" class="cmd-input flex-1">
-        <button @click="$emit('copy-uninstall')" class="btn btn-icon btn-green ml-2" :title="trans.copy">{{ uninstallCopied ? '✅' : '📋' }}</button>
+        <button @click="$emit('copy-uninstall')" class="btn btn-icon btn-green ml-2" :aria-label="trans.copy">{{ uninstallCopied ? '✅' : '📋' }}</button>
       </div>
-
-      <p class="text-muted mb-4">
-        <span class="warning-icon">[i]</span> {{ trans.clickToCopyCmd }}
-      </p>
 
       <div class="modal-footer flex-justify-between">
         <button @click="$emit('confirm-delete')" class="btn btn-red">{{ trans.confirmDelete }}</button>
@@ -78,7 +75,10 @@
 </template>
 
 <script setup>
-defineProps({
+import { computed, ref, watch } from 'vue'
+import HelpTooltip from '../../../components/HelpTooltip.vue'
+
+const props = defineProps({
   trans: { type: Object, required: true },
   show: { type: Boolean, default: false },
   deleteServerId: { type: [String, Number], default: '' },
@@ -90,7 +90,7 @@ defineProps({
   uninstallCopied: { type: Boolean, default: false }
 })
 
-defineEmits([
+const emit = defineEmits([
   'close',
   'confirm-delete',
   'copy-uninstall',
@@ -98,4 +98,48 @@ defineEmits([
   'update:delete-version',
   'update:delete-gh-proxy'
 ])
+
+const CUSTOM_GH_PROXY_VALUE = '__custom__'
+const ghProxyOptions = [
+  { value: '', label: props.trans.ghProxyPlaceholder || 'Direct' },
+  { value: 'https://ghfast.top/', label: 'https://ghfast.top/' },
+  { value: 'https://ghproxy.net/', label: 'https://ghproxy.net/' },
+  { value: 'https://gh.llkk.cc/', label: 'https://gh.llkk.cc/' },
+  { value: 'https://gh-proxy.com/', label: 'https://gh-proxy.com/' }
+]
+
+const manualCustomGhProxy = ref(false)
+const isKnownGhProxy = (value) => ghProxyOptions.some(option => option.value === String(value || '').trim())
+
+const selectedGhProxy = computed({
+  get: () => {
+    const currentProxy = String(props.deleteGhProxy || '').trim()
+    if (manualCustomGhProxy.value || (!isKnownGhProxy(currentProxy) && currentProxy)) {
+      return CUSTOM_GH_PROXY_VALUE
+    }
+    return currentProxy
+  },
+  set: (value) => {
+    if (value === CUSTOM_GH_PROXY_VALUE) {
+      manualCustomGhProxy.value = true
+      if (isKnownGhProxy(props.deleteGhProxy)) {
+        emit('update:delete-gh-proxy', '')
+      }
+      return
+    }
+    manualCustomGhProxy.value = false
+    emit('update:delete-gh-proxy', value)
+  }
+})
+
+const showCustomGhProxy = computed(() => selectedGhProxy.value === CUSTOM_GH_PROXY_VALUE)
+
+watch(
+  () => props.show,
+  (show) => {
+    if (show && isKnownGhProxy(props.deleteGhProxy)) {
+      manualCustomGhProxy.value = false
+    }
+  }
+)
 </script>

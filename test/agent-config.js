@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
+  AGENT_CONFIG_CONNECTION_MODE_SCHEMA_VERSION,
+  AGENT_CONFIG_LEGACY_SCHEMA_VERSION,
+  AGENT_CONFIG_SCHEMA_VERSION,
   buildAgentConfig,
   describeAgentConfig,
   isValidTrafficCorrection,
@@ -11,21 +14,43 @@ import {
   validatePingNode
 } from '../src/utils/agentConfig.js';
 import { md5Hash } from '../src/utils/common.js';
+import { isWssReportEnabled, normalizeWssReportHours } from '../src/utils/settings.js';
 
 const server = {
   collect_interval: 1,
   report_interval: 60,
   reset_day: 15
 };
-const expected = 'collect_interval=1&report_interval=60&reset_day=15&schema_version=3&custom_ct=&custom_cu=&custom_cm=&custom_bd=&interface=';
+const expected = 'collect_interval=1&report_interval=60&reset_day=15&schema_version=5&custom_ct=&custom_cu=&custom_cm=&custom_bd=&interface=&connection_mode=http';
+const expectedWssEnabled = 'collect_interval=1&report_interval=60&reset_day=15&schema_version=5&custom_ct=&custom_cu=&custom_cm=&custom_bd=&interface=&connection_mode=auto&wss_report_interval=2';
+const expectedLegacy = 'collect_interval=1&report_interval=60&reset_day=15&schema_version=3&custom_ct=&custom_cu=&custom_cm=&custom_bd=&interface=';
 
 const config = buildAgentConfig(server);
 assert.equal(serializeAgentConfig(config), expected);
+assert.equal(serializeAgentConfig(buildAgentConfig(server, { wss_report_enabled: 'true' })), expectedWssEnabled);
+assert.equal(serializeAgentConfig(buildAgentConfig(server, { wss_report_enabled: 'true', wss_report_hours: [] })), expectedWssEnabled);
+assert.equal(serializeAgentConfig(buildAgentConfig(server, null, AGENT_CONFIG_LEGACY_SCHEMA_VERSION)), expectedLegacy);
 
 const descriptor = await describeAgentConfig(server);
 assert.equal(descriptor.serialized, expected);
 assert.equal(descriptor.md5, createHash('md5').update(expected).digest('hex'));
 assert.equal(descriptor.correction, null);
+
+const legacyDescriptor = await describeAgentConfig(server, null, AGENT_CONFIG_LEGACY_SCHEMA_VERSION);
+assert.equal(legacyDescriptor.serialized, expectedLegacy);
+assert.equal(Object.prototype.hasOwnProperty.call(legacyDescriptor.config, 'connection_mode'), false);
+
+const schema4Server = { ...server, collect_interval: 0, reset_day: 1 };
+const schema4Expected = 'collect_interval=0&report_interval=60&reset_day=1&schema_version=4&custom_ct=&custom_cu=&custom_cm=&custom_bd=&interface=&connection_mode=auto';
+const schema4Descriptor = await describeAgentConfig(
+  schema4Server,
+  { wss_report_enabled: 'true' },
+  AGENT_CONFIG_CONNECTION_MODE_SCHEMA_VERSION
+);
+assert.equal(schema4Descriptor.serialized, schema4Expected);
+assert.equal(schema4Descriptor.md5, createHash('md5').update(schema4Expected).digest('hex'));
+assert.equal(schema4Descriptor.config.collect_interval, 0);
+assert.equal(Object.prototype.hasOwnProperty.call(schema4Descriptor.config, 'wss_report_interval'), false);
 
 const autoUpdateDescriptor = await describeAgentConfig({ ...server, auto_update: '1' });
 assert.equal(autoUpdateDescriptor.serialized, expected);
@@ -63,8 +88,41 @@ assert.deepEqual(buildAgentConfig({}), {
   custom_cm: '',
   custom_bd: '',
   interface: '',
-  schema_version: 3
+  schema_version: AGENT_CONFIG_SCHEMA_VERSION,
+  connection_mode: 'http'
 });
+assert.equal(buildAgentConfig({ connection_mode: 'post' }).connection_mode, 'http');
+assert.equal(buildAgentConfig({ connection_mode: 'auto' }, { wss_report_enabled: 'true' }).connection_mode, 'auto');
+assert.equal(buildAgentConfig({ connection_mode: 'auto' }, { wss_report_enabled: 'true' }).wss_report_interval, 2);
+assert.equal(buildAgentConfig({ collect_interval: 0, connection_mode: 'auto' }, { wss_report_enabled: 'true' }).collect_interval, 2);
+assert.equal(buildAgentConfig({ collect_interval: 10, wss_report_interval: 2, connection_mode: 'auto' }, { wss_report_enabled: 'true' }).collect_interval, 2);
+assert.equal(buildAgentConfig({ collect_interval: 10, wss_report_interval: 2, connection_mode: 'http' }, { wss_report_enabled: 'true' }).collect_interval, 10);
+assert.equal(buildAgentConfig({ connection_mode: 'http' }, { wss_report_enabled: 'true' }).connection_mode, 'http');
+assert.equal(Object.prototype.hasOwnProperty.call(
+  buildAgentConfig({ connection_mode: 'http' }, { wss_report_enabled: 'true' }),
+  'wss_report_interval'
+), false);
+assert.deepEqual(normalizeWssReportHours(undefined), Array.from({ length: 24 }, (_, hour) => hour));
+assert.deepEqual(normalizeWssReportHours('[23, 2, 2, 99, "4"]'), [2, 4, 23]);
+assert.deepEqual(normalizeWssReportHours([]), []);
+assert.equal(isWssReportEnabled(
+  { wss_report_enabled: 'true', wss_report_hours: [8, 9] },
+  new Date('2026-08-20T08:30:00Z')
+), true);
+assert.equal(isWssReportEnabled(
+  { wss_report_enabled: 'true', wss_report_hours: [8, 9] },
+  new Date('2026-08-20T10:00:00Z')
+), false);
+assert.equal(isWssReportEnabled(
+  { wss_report_enabled: 'false', wss_report_hours: [8] },
+  new Date('2026-08-20T08:30:00Z')
+), false);
+assert.equal(validateAgentConfigInput({ ...server, connection_mode: 'http' }).config.connection_mode, 'http');
+assert.equal(validateAgentConfigInput({ ...server, connection_mode: 'bad' }).valid, false);
+assert.equal(validateAgentConfigInput({ ...server, wss_report_interval: 1 }).valid, true);
+assert.equal(validateAgentConfigInput({ ...server, wss_report_interval: 5 }).valid, true);
+assert.equal(validateAgentConfigInput({ ...server, wss_report_interval: 0 }).valid, false);
+assert.equal(validateAgentConfigInput({ ...server, wss_report_interval: 6 }).valid, false);
 
 // Test server-level ping node priority
 const serverWithCustomPing = {

@@ -20,6 +20,7 @@
 - [1. 鉴权与 Turnstile 流程](#1-鉴权与-turnstile-流程)
 - **[2. 公开 API](#2-公开-api)**
   - **[2.1 获取站点配置](#21-获取站点配置)**
+  - **[2.1.1 保存第三方主题配置](#211-保存第三方主题配置)**
   - **[2.2 获取服务器列表](#22-获取服务器列表)**
   - [2.3 获取服务器详情](#23-获取服务器详情)
   - [2.4 获取历史指标](#24-获取历史指标)
@@ -98,6 +99,7 @@ my-theme/
 - 旗帜和 OS 图标走默认皮肤静态文件，不要打包进主题：旗帜使用 `/flags/<code>.svg`，OS 图标使用 `/os-icons/<filename>`
 - 站点标题、背景图、自定义 `<head>`、自定义脚本由用户后台外观设置控制，主题不要把这些配置写死
 - 主题不可用时应让页面暴露加载错误，不要在主题内静默跳转到其他页面
+- 主题底部需要展示 `Powered by CF-Server-Monitor`，并链接到 [https://github.com/huilang-me/CF-Server-Monitor/](https://github.com/huilang-me/CF-Server-Monitor/)；建议同时输出 `/api/config` 返回的 `version`，例如 `Powered by CF-Server-Monitor v2.7.12 Beta`
 
 路由约定：
 
@@ -122,12 +124,15 @@ my-theme/
 
 ### 1.1 鉴权机制
 
-项目使用两套鉴权机制：
+项目使用以下鉴权机制：
 
 | 机制         | 使用位置            | 方式                                           |
 | ---------- | --------------- | -------------------------------------------- |
-| JWT Bearer | 非公开站点读取公开 API、查看 1 小时以上历史 | `Authorization: Bearer <token>`              |
+| JWT Bearer | 非公开站点读取公开 API、查看 1 小时以上历史、保存第三方主题配置 | `Authorization: Bearer <token>`              |
+| WebSocket JWT | 非公开站点连接 `/api/ws` | `Authorization: Bearer <token>`、`Cookie: cfsm_auth=<token>` 或查询参数 `token` / `auth_token` / `ws_token` |
 | Turnstile  | 公开 API（当启用时）    | `X-Turnstile-Token` 或 `X-Turnstile-Verified` |
+
+浏览器原生 WebSocket 不能自定义 `Authorization` Header。第三方主题在私有站点中连接 `/api/ws` 时，同域走登录后的 `cfsm_auth` Cookie，跨域走 WebSocket URL 查询参数 `token=<jwt>`。查询参数 token 可能出现在访问日志中，请只通过 HTTPS 使用。
 
 ### 1.2 Turnstile 人机验证流程
 
@@ -150,6 +155,7 @@ my-theme/
 
 - `/api/ws`、`/api/config`（不带 Turnstile Header 时）无需验证
 - `/api/config` 带 `X-Turnstile-Token` 或 `X-Turnstile-Verified` 时会进入验证流程，并通过 `verified` / `turnstile_verified` 返回验证结果
+- `/api/ws` 不参与 Turnstile 验证，但非公开站点仍需要通过 WebSocket JWT 认证
 - `turnstile_enabled` 是全局 API 验证开关，`turnstile_login_enabled` 是内置后台登录页验证开关；第三方主题不实现登录页，管理入口跳转 `/admin#admin`
 
 ***
@@ -158,6 +164,7 @@ my-theme/
 
 > 若站点非公开（`is_public !== 'true'`），所有接口需携带 JWT。
 > 启用 Turnstile 时需携带 `X-Turnstile-Token` 或 `X-Turnstile-Verified`。
+> `POST /api/theme_options` 是写接口，无论站点是否公开都需要 JWT。
 
 ### 2.1 获取站点配置
 
@@ -187,7 +194,9 @@ Headers: (可选) Authorization: Bearer <jwt>, X-Turnstile-Token / X-Turnstile-V
   },
   "verified": false,
   "turnstile_verified": null,
-  "long_history_points": 120
+  "frontend_ws_timeout_minutes": 20,
+  "long_history_points": 120,
+  "latency_window": { "points": 20, "hours": 2 }
 }
 ```
 
@@ -207,15 +216,77 @@ Headers: (可选) Authorization: Bearer <jwt>, X-Turnstile-Token / X-Turnstile-V
 | `theme_options`      | object       | 第三方主题自定义配置；未配置时为空对象 |
 | `verified`           | boolean      | 当前请求是否已验证       |
 | `turnstile_verified` | string\|null | 已验证凭证，缓存复用 1 小时 |
+| `frontend_ws_timeout_minutes` | number | 前端实时订阅连接超时分钟数，范围 `0`-`1440`；默认 `0` 表示不超时 |
 | `long_history_points` | number      | 长历史查询返回的采样点数，可选 `60`、`120`、`180`、`240` |
+| `latency_window` | object | `/api/servers` 的 `servers[].ping` / `servers[].loss` 窗口参数，`points` 为最多真实点数，`hours` 为回看小时数 |
 
-`theme_options` 对第三方主题是只读运行时配置。需要修改主题配置时，跳转到内置后台 `/admin#admin`，不要在第三方主题内调用管理端接口。
+`theme_options` 是第三方主题的运行时配置。读取时使用 `/api/config`，保存主题自身配置时使用 `POST /api/theme_options`；不要在第三方主题内调用 `save_settings` 或其他管理端接口。
 
 **示例**：
 
 ```js
 const res = await fetch('/api/config');
 const config = await res.json();
+```
+
+***
+
+### 2.1.1 保存第三方主题配置
+
+第三方主题如需要保存自身配置，使用独立接口 `POST /api/theme_options`。该接口只更新 `appearance_options.theme_options`，不会修改 `site_options`，也不会覆盖 `appearance_options` 中的站点标题、背景图、CSP、自定义脚本等其他外观设置。
+
+**Request**
+
+```
+POST /api/theme_options
+Headers: Authorization: Bearer <jwt>, Content-Type: application/json, X-Turnstile-Token / X-Turnstile-Verified
+```
+
+启用全局 Turnstile 时需要携带 `X-Turnstile-Token` 或 `X-Turnstile-Verified`；未启用时只需要 JWT。`theme_options` 必须是非数组对象，传数组、字符串或 `null` 会返回 `400 invalidThemeOptionsFormat`。
+
+```json
+{
+  "theme_options": {
+    "layout": "compact",
+    "accent": "green"
+  }
+}
+```
+
+**Response**
+
+```json
+{
+  "success": true,
+  "theme_options": {
+    "layout": "compact",
+    "accent": "green"
+  },
+  "message": "updateSuccess"
+}
+```
+
+**示例**：
+
+```js
+async function saveThemeOptions(themeOptions, token, turnstileVerified) {
+  const headers = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${token}`
+  };
+  if (turnstileVerified) {
+    headers['X-Turnstile-Verified'] = turnstileVerified;
+  }
+
+  const res = await fetch('/api/theme_options', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ theme_options: themeOptions })
+  });
+  const result = await res.json();
+  if (!res.ok) throw new Error(result.error || 'saveThemeOptionsFailed');
+  return result.theme_options;
+}
 ```
 
 ***
@@ -248,7 +319,7 @@ Headers: (按需) Authorization: Bearer <jwt>, X-Turnstile-Token/Verified
     "show_price": true,
     "show_expire": true,
     "show_tf": true,
-    "show_time": true
+    "show_three_net_details": true
   }
 }
 ```
@@ -261,6 +332,8 @@ Headers: (按需) Authorization: Bearer <jwt>, X-Turnstile-Token/Verified
 | `stats`       | 聚合统计（在线阈值 5 分钟）             |
 | `regionStats` | 按区域统计服务器数量                  |
 | `sysConfig`   | 站点开关配置，控制 UI 显示；主题配置请从 `/api/config` 的 `theme_options` 读取 |
+
+`servers[].ping` / `servers[].loss` 仅在列表接口返回，点格式为 `{ ts, ct, cu, cm, bd }`。只有后台开启三网详情（`sysConfig.show_three_net_details === true`）时，后端才会从 D1 最近 2 小时历史中抽样这些窗口数据；关闭时为节省 D1 / Workers 消耗，数组为空。
 
 **示例**：
 
@@ -299,6 +372,7 @@ Headers: (按需) Authorization, X-Turnstile-Token/Verified
   "traffic_calc_type": "total",
   "reset_day": 1,
   "report_interval": 60,
+  "wss_report_interval": 2,
   "is_hidden": "0",
   "sort_order": 0,
   "cpu": 12.34,
@@ -359,7 +433,9 @@ Headers: (按需) Authorization, X-Turnstile-Token/Verified
 }
 ```
 
-`tags` 为英文逗号分隔字符串。`note` 属于管理端内部字段，不从 dashboard 公共接口返回。`disk` 为可选磁盘 IO 指标对象：`read_bps` / `write_bps` 单位为 B/s，`read_iops` / `write_iops` 为 IOPS，`await_ms` 为毫秒，`util` 为百分比；旧探针、旧数据缺失，或者 6 个子字段全为 0 时，API / WebSocket 不返回该对象，主题不应展示依赖磁盘 IO 的图表。`latestReportUpdates` 与 `/api/servers` 同名字段形状一致，REST 样本统一为 `{ ts, data }` 并按探针采样包透传；内置探针默认只在普通采样点上报 `cpu`、`ram_total`、`ram_used`、`swap_total`、`swap_used`、`net_in_speed`、`net_out_speed`，每次报告最后一个样本可能额外携带 `disk` 等报告级字段；缓存约 5 分钟，允许为空数组。`gpu` 已废弃，主题应使用 `gpu_info`；新版上报和 WebSocket 实时数据为 `[{ id, name, info }]` 数组，历史/详情 REST 响应中可能是同结构的 JSON 字符串。
+`tags` 为英文逗号分隔字符串。`note` 属于管理端内部字段，不从 dashboard 公共接口返回。`disk` 为可选磁盘 IO 指标对象：`read_bps` / `write_bps` 单位为 B/s，`read_iops` / `write_iops` 为 IOPS，`await_ms` 为毫秒，`util` 为百分比；旧探针、旧数据缺失，或者 6 个子字段全为 0 时，API / WebSocket 不返回该对象，主题不应展示依赖磁盘 IO 的图表。`latestReportUpdates` 与 `/api/servers` 同名字段形状一致，REST 样本统一为 `{ ts, data }` 并按探针批量采样包透传；内置探针默认只在普通采样点上报 `cpu`、`ram_total`、`ram_used`、`swap_total`、`swap_used`、`net_in_speed`、`net_out_speed`，每次报告最后一个样本可能额外携带 `disk` 等报告级字段；回放状态保留约 5 分钟，允许为空数组。`gpu` 已废弃，主题应使用 `gpu_info`；新版上报和 WebSocket 实时数据为 `[{ id, name, info }]` 数组，历史/详情 REST 响应中可能是同结构的 JSON 字符串。
+
+`ping` / `loss` 窗口数组仅在 `/api/servers` 的 `servers[]` 中返回，`/api/server` 详情接口不返回新增窗口数组。主题可从 `/api/config` 的 `latency_window` 读取当前窗口参数。只有后台开启三网详情时才会查询窗口数据；关闭时后端仍返回 `ping: []` / `loss: []`，主题不应展示三网小图。开启后，窗口从 D1 历史表最近 2 小时按时间范围抽样，最多 20 个真实样本点，点格式为 `{ ts, ct, cu, cm, bd }`，其中 `ct` / `cu` / `cm` / `bd` 分别对应不同探测线路。时间间隔目标约 6 分钟，但 `ts` 保留真实上报时间，不会强制对齐为等差序列；历史不足、上报中断或某个时间段无数据时不会用最近点补齐，数组可能少于 20 个。该 D1 抽样结果在当前 Worker isolate 内缓存约 5 分钟，缓存不跨 isolate 共享。
 
 **失败返回**：
 
@@ -462,6 +538,13 @@ Headers: Upgrade: websocket, Connection: Upgrade
 | 参数 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `subscribe` | 否 | `all` | `all` 订阅所有服务器，`<serverId>` 只订阅指定服务器 |
+| `token` / `auth_token` / `ws_token` | 否 | - | 非公开站点可用的 JWT 查询参数认证；公开站点不需要 |
+
+**鉴权**：
+
+- 公开站点：无需 JWT。
+- 非公开站点：连接 `/api/ws` 必须通过 WebSocket JWT 认证，支持 `Authorization: Bearer <jwt>`、`Cookie: cfsm_auth=<jwt>`、查询参数 `token` / `auth_token` / `ws_token`。
+- 浏览器主题通常不能设置 WebSocket `Authorization` Header；同域部署使用 `cfsm_auth` Cookie，跨域或纯静态主题在 WebSocket URL 上追加 `token=<jwt>`。
 
 **过滤机制**：
 
@@ -476,12 +559,29 @@ Headers: Upgrade: websocket, Connection: Upgrade
 
 当配置了多个 `apiBase` 时，前端会为每个 apiBase 创建独立的 WebSocket 连接。每个连接发送的 `ids` 应只包含该 apiBase 返回的服务器 ID，而非全部服务器 ID。每个 Worker/DO 只知道自己的服务器，传入不属于它的 ID 不会产生任何效果。
 
-**推荐流程**：
+**推荐流程（首页/列表页）**：
 
 1. 调用 `GET /api/servers` 获取服务器列表（已按登录状态过滤隐藏服务器）
 2. 提取返回的 `servers[].id` 数组
 3. 连接 WebSocket：`?subscribe=all`
 4. 建连后通过 WebSocket 通道发送 `{ type: "subscribe", scope: "all", ids }`
+
+**推荐流程（详情页）**：
+
+详情页只展示单台服务器时，应使用单服务器接口和单服务器 WebSocket 订阅，以降低后端推送量、前端渲染压力和额度消耗：
+
+- HTTP 初始数据：`GET https://example.com/api/server?id=<id>`
+- WebSocket 实时订阅：`wss://example.com/api/ws?subscribe=<id>`
+
+非公开站点同域部署时直接使用 Cookie 认证；跨域或纯静态主题无法依赖同域 Cookie 时，再使用查询参数认证：`wss://example.com/api/ws?subscribe=<id>&token=<jwt>`。
+
+详情页不要使用 `GET https://example.com/api/servers` 拉全量列表，也不要使用 `wss://example.com/api/ws?subscribe=all` 订阅全量更新后再在前端过滤。
+
+**页面可见性建议**：
+
+为实现前端展示效果并节省额度消耗，主题应监听 `document.visibilitychange`，页面进入后台或隐藏时主动关闭 WebSocket，页面重新可见时再按当前页面类型重新连接并恢复订阅。关闭连接后可保留最后一次数据用于静态展示；重新可见时建议先按当前页面补一次 REST 数据，再恢复 WebSocket 实时更新。
+
+主题还应读取 `/api/config` 的 `frontend_ws_timeout_minutes`。值为 `0` 时不按连接时长断开；值为正整数时，应在单次连接达到对应分钟数后主动关闭，并由用户明确选择是否继续连接。继续后应建立新连接并重新开始计时，不应在用户选择关闭后静默重连。
 
 **推送策略**：
 
@@ -511,7 +611,14 @@ const { servers } = await (await fetch('/api/servers')).json();
 const ids = servers.map(s => s.id);
 
 // 2. 连接 WebSocket，并通过通道消息提交订阅 ID 列表
-const ws = new WebSocket('wss://status.example.com/api/ws?subscribe=all');
+const url = new URL('wss://status.example.com/api/ws');
+url.searchParams.set('subscribe', 'all');
+const sameHost = url.host === location.host;
+if (!sameHost) {
+  const token = localStorage.getItem('jwt_token');
+  if (token) url.searchParams.set('token', token);
+}
+const ws = new WebSocket(url.toString());
 ws.onopen = () => {
   ws.send(JSON.stringify({ type: 'subscribe', scope: 'all', ids }));
 };
@@ -530,7 +637,14 @@ ws.onmessage = (ev) => {
 **示例（subscribe=serverId，实时推送）**：
 
 ```js
-const ws = new WebSocket('wss://status.example.com/api/ws?subscribe=server-001');
+const url = new URL('wss://status.example.com/api/ws');
+url.searchParams.set('subscribe', 'server-001');
+const sameHost = url.host === location.host;
+if (!sameHost) {
+  const token = localStorage.getItem('jwt_token');
+  if (token) url.searchParams.set('token', token);
+}
+const ws = new WebSocket(url.toString());
 ws.onmessage = (ev) => {
   const msg = JSON.parse(ev.data);
   if (msg.type === 'batchUpdate') {
@@ -571,6 +685,10 @@ ws.onmessage = (ev) => {
 | 500  | 服务器内部错误        | 联系管理员                |
 | 503  | WebSocket 不可用  | 降级为轮询                |
 
+常见 `400` 错误字符串：
+
+- `invalidThemeOptionsFormat`：`theme_options` 不是非数组对象
+
 ***
 
 ## 5. 类型定义
@@ -583,6 +701,14 @@ interface DiskIoMetrics {
   write_iops: number;
   await_ms: number;
   util: number;       // %
+}
+
+interface LatencyWindowPoint {
+  ts: number;
+  ct?: number | null | false;
+  cu?: number | null | false;
+  cm?: number | null | false;
+  bd?: number | null | false;
 }
 
 interface Server {
@@ -599,6 +725,7 @@ interface Server {
   traffic_calc_type: string;
   reset_day: number;
   report_interval: number;
+  wss_report_interval: number;
   is_hidden: '0' | '1';
   sort_order: number;
   cpu: number;
@@ -612,14 +739,16 @@ interface Server {
   processes: number;
   tcp_conn: number;
   udp_conn: number;
-  ping_ct: number | null;
-  ping_cu: number | null;
-  ping_cm: number | null;
-  ping_bd: number | null;
-  loss_ct: number | null;
-  loss_cu: number | null;
-  loss_cm: number | null;
-  loss_bd: number | null;
+  ping_ct: number | null | false;
+  ping_cu: number | null | false;
+  ping_cm: number | null | false;
+  ping_bd: number | null | false;
+  loss_ct: number | null | false;
+  loss_cu: number | null | false;
+  loss_cm: number | null | false;
+  loss_bd: number | null | false;
+  ping?: LatencyWindowPoint[]; // 仅 /api/servers 的列表项返回；三网详情关闭时为空数组
+  loss?: LatencyWindowPoint[]; // 仅 /api/servers 的列表项返回；三网详情关闭时为空数组
   ram_total: number;
   ram_used: number;
   swap_total: number;
@@ -659,7 +788,6 @@ interface SysConfig {
   show_price?: boolean;
   show_expire?: boolean;
   show_tf?: boolean;
-  show_time?: boolean;
   long_history_points?: number;
 }
 
@@ -676,7 +804,14 @@ interface SiteConfig {
   theme_options: Record<string, unknown>;
   verified: boolean;
   turnstile_verified: string | null;
+  frontend_ws_timeout_minutes: number;
   long_history_points: number;
+}
+
+interface ThemeOptionsSaveResponse {
+  success: true;
+  theme_options: Record<string, unknown>;
+  message: 'updateSuccess';
 }
 
 interface WsMessage {

@@ -1,5 +1,5 @@
 import { checkAuth, simpleAuthResponse } from '../middleware/auth.js';
-import { getLatestMetrics, getLatestMetricsForAllServers } from '../database/schema.js';
+import { getDashboardLatencyHistory, getLatestMetrics, getLatestMetricsForAllServers } from '../database/schema.js';
 import { getAllServers, getServerDetail } from '../utils/cache.js';
 import { mergeMetricsIntoServer, coerceNumericMetricFields } from '../utils/metrics.js';
 import { normalizeLongHistoryPoints } from '../utils/settings.js';
@@ -9,8 +9,12 @@ import {
   getLatestReportSampleTimestamp,
   getWorkerLatestReportUpdates
 } from '../utils/latestReportCache.js';
+import { markFrontendRealtimeActive } from '../utils/realtimeBroadcastGate.js';
+import { DASHBOARD_LATEST_REPORT_ID_CHUNK_SIZE } from '../utils/config.js';
 
-const LATEST_REPORT_ID_CHUNK_SIZE = 500;
+function createEmptyLatencyWindow() {
+  return { ping: [], loss: [] };
+}
 
 function toPublicIpReachability(value) {
   const normalized = String(value ?? '').trim().toLowerCase();
@@ -64,16 +68,25 @@ function normalizeLatestReportUpdate(update) {
   };
 }
 
-async function getDurableLatestReportUpdates(env, serverIds) {
-  if (!env.METRICS_BROADCASTER || !Array.isArray(serverIds) || serverIds.length === 0) return [];
+function attachLatencyHistoryToServers(servers, latencyHistory) {
+  for (const server of servers || []) {
+    const window = latencyHistory?.get(String(server.id)) || createEmptyLatencyWindow();
+    server.ping = window.ping;
+    server.loss = window.loss;
+  }
+}
+
+async function getDurableRealtimeState(env, serverIds) {
+  const empty = { latestReportUpdates: [] };
+  if (!env.METRICS_BROADCASTER || !Array.isArray(serverIds) || serverIds.length === 0) return empty;
 
   try {
     const id = env.METRICS_BROADCASTER.idFromName('global');
     const stub = env.METRICS_BROADCASTER.get(id);
     const updates = [];
 
-    for (let offset = 0; offset < serverIds.length; offset += LATEST_REPORT_ID_CHUNK_SIZE) {
-      const chunk = serverIds.slice(offset, offset + LATEST_REPORT_ID_CHUNK_SIZE);
+    for (let offset = 0; offset < serverIds.length; offset += DASHBOARD_LATEST_REPORT_ID_CHUNK_SIZE) {
+      const chunk = serverIds.slice(offset, offset + DASHBOARD_LATEST_REPORT_ID_CHUNK_SIZE);
       const response = await stub.fetch('http://internal/latest-report-updates', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -84,10 +97,10 @@ async function getDurableLatestReportUpdates(env, serverIds) {
       if (Array.isArray(data?.updates)) updates.push(...data.updates);
     }
 
-    return updates;
+    return { latestReportUpdates: updates };
   } catch (e) {
-    console.warn('[Dashboard] Failed to read latest report updates:', e?.message || e);
-    return [];
+    console.warn('[Dashboard] Failed to read realtime state:', e?.message || e);
+    return empty;
   }
 }
 
@@ -119,26 +132,31 @@ function mergeLatestReportUpdates(serverIds, durableUpdates, workerUpdates) {
     .filter(Boolean);
 }
 
-async function getLatestReportUpdatesForServers(env, serverIds) {
+async function getRealtimeStateForServers(env, serverIds) {
   const normalizedServerIds = Array.from(new Set(
     (Array.isArray(serverIds) ? serverIds : [])
       .map(serverId => String(serverId || '').trim())
       .filter(Boolean)
   ));
-  if (normalizedServerIds.length === 0) return [];
+  if (normalizedServerIds.length === 0) {
+    return { latestReportUpdates: [] };
+  }
 
-  const durableLatestReportUpdates = await getDurableLatestReportUpdates(env, normalizedServerIds);
+  const durableState = await getDurableRealtimeState(env, normalizedServerIds);
+  const durableLatestReportUpdates = durableState.latestReportUpdates;
 
   // DO 命中后反向预热当前 Worker isolate，降低随后 DO 休眠造成的空缓存概率。
   for (const update of durableLatestReportUpdates) {
     cacheLatestReportUpdate(update.serverId, update.samples, update.reportTs);
   }
 
-  return mergeLatestReportUpdates(
-    normalizedServerIds,
-    durableLatestReportUpdates,
-    getWorkerLatestReportUpdates(normalizedServerIds)
-  );
+  return {
+    latestReportUpdates: mergeLatestReportUpdates(
+      normalizedServerIds,
+      durableLatestReportUpdates,
+      getWorkerLatestReportUpdates(normalizedServerIds)
+    )
+  };
 }
 
 export async function handleServerAPI(request, env, sys) {
@@ -147,6 +165,7 @@ export async function handleServerAPI(request, env, sys) {
   if (sys.is_public !== 'true' && !isLoggedIn) {
     return simpleAuthResponse();
   }
+  markFrontendRealtimeActive();
   
   const url = new URL(request.url);
   const id = url.searchParams.get('id');
@@ -156,12 +175,12 @@ export async function handleServerAPI(request, env, sys) {
   const server = await getServerDetail(env.DB, id, isLoggedIn);
   if (!server) return createNotFoundResponse('Server not found');
   
-  const [latestMetrics, latestReportUpdates] = await Promise.all([
+  const [latestMetrics, realtimeState] = await Promise.all([
     getLatestMetrics(env.DB, id, server),
-    getLatestReportUpdatesForServers(env, [id])
+    getRealtimeStateForServers(env, [id])
   ]);
   mergeMetricsIntoServer(server, latestMetrics);
-  server.latestReportUpdates = latestReportUpdates;
+  server.latestReportUpdates = realtimeState.latestReportUpdates;
   server.sysConfig = {
     long_history_points: Number(normalizeLongHistoryPoints(sys.long_history_points))
   };
@@ -175,14 +194,20 @@ export async function handleServersAPI(request, env, sys) {
   if (sys.is_public !== 'true' && !isLoggedIn) {
     return simpleAuthResponse();
   }
+  markFrontendRealtimeActive();
   
   const results = (await getAllServers(env.DB, isLoggedIn)).map(withoutPrivateServerFields);
+  const shouldIncludeLatencyHistory = sys.show_three_net_details === 'true';
   
   const serverIds = results.map(server => server.id).filter(Boolean);
-  const [latestMetricsMap, latestReportUpdates] = await Promise.all([
+  const [latestMetricsMap, realtimeState, latencyHistory] = await Promise.all([
     getLatestMetricsForAllServers(env.DB),
-    getLatestReportUpdatesForServers(env, serverIds)
+    getRealtimeStateForServers(env, serverIds),
+    shouldIncludeLatencyHistory
+      ? getDashboardLatencyHistory(env.DB, results)
+      : Promise.resolve(new Map())
   ]);
+  attachLatencyHistoryToServers(results, latencyHistory);
   
   const now = Date.now();
   let globalOnline = 0;
@@ -219,7 +244,7 @@ export async function handleServersAPI(request, env, sys) {
 
   const data = {
     servers: results,
-    latestReportUpdates,
+    latestReportUpdates: realtimeState.latestReportUpdates,
     stats: {
       total: results.length,
       online: globalOnline,
@@ -234,7 +259,7 @@ export async function handleServersAPI(request, env, sys) {
       show_price: sys.show_price === 'true',
       show_expire: sys.show_expire === 'true',
       show_tf: sys.show_tf === 'true',
-      show_time: sys.show_time === 'true',
+      show_three_net_details: sys.show_three_net_details === 'true',
       display_mode: sys.display_mode || 'bar'
     }
   };

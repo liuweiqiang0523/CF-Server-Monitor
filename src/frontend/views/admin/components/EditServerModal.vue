@@ -39,10 +39,9 @@
       <div class="form-row mobile-two-row">
         <div class="form-group flex-1">
           <label class="form-label">{{ trans.currency }}</label>
-          <input type="text" v-model="editForm.currency" class="form-input" list="currency-list" placeholder="e.g. $, ¥, €">
-          <datalist id="currency-list">
-            <option v-for="item in currencyOptions" :key="item.symbol" :value="item.symbol">{{ currencyLabel(item) }}</option>
-          </datalist>
+          <select v-model="editForm.currency" class="form-select">
+            <option v-for="item in currencySelectOptions" :key="item.symbol" :value="item.symbol">{{ currencyLabel(item) }}</option>
+          </select>
         </div>
 
         <div class="form-group flex-1">
@@ -87,7 +86,10 @@
           <input type="date" name="edit_expire_date" autocomplete="off" v-model="editForm.expire_date" class="form-input" @click="openDatePicker">
         </div>
         <div class="form-group flex-1">
-          <label class="form-label">{{ trans.trafficResetDay }}</label>
+          <label class="form-label">
+            {{ trans.trafficResetDay }}
+            <HelpTooltip :text="trans.trafficResetDayTip" />
+          </label>
           <select ref="editResetDayRef" name="edit_reset_day" v-model="editForm.reset_day" class="form-select">
             <option :value="0">0</option>
             <option v-for="day in 31" :key="day" :value="day">{{ day }}</option>
@@ -97,7 +99,10 @@
 
       <div class="form-row">
         <div class="form-group flex-1">
-          <label class="form-label">{{ trans.collectInterval }}</label>
+          <label class="form-label">
+            {{ trans.collectInterval }}
+            <HelpTooltip :text="trans.collectIntervalHint" />
+          </label>
           <select v-model="editForm.collect_interval" class="form-select">
             <option :value="0">0</option>
             <option :value="1">1</option>
@@ -116,18 +121,40 @@
           </select>
         </div>
         <div class="form-group flex-1">
-          <label class="form-label">{{ trans.networkInterface }}</label>
-          <input type="text" name="edit_interface" autocomplete="off" v-model.trim="editForm.interface" class="form-input" :placeholder="trans.networkInterfacePlaceholder">
+          <label class="form-label">
+            {{ trans.connectionMode }}
+            <HelpTooltip v-if="!isWssReportEnabled" :text="trans.wssReportDisabledConnectionHint" />
+          </label>
+          <select v-model="editForm.connection_mode" class="form-select" :disabled="!isWssReportEnabled">
+            <option value="auto">{{ trans.connectionModeAuto }}</option>
+            <option value="http">{{ trans.connectionModeHttp }}</option>
+          </select>
+        </div>
+        <div v-if="isWssReportEnabled && editForm.connection_mode === 'auto'" class="form-group flex-1">
+          <label class="form-label">{{ trans.wssReportInterval }}</label>
+          <select v-model="editForm.wss_report_interval" class="form-select">
+            <option v-for="second in 5" :key="second" :value="second">{{ second }}</option>
+          </select>
         </div>
       </div>
 
       <div class="form-row">
         <div class="form-group flex-1">
-          <label class="form-label">{{ trans.rxCorrection }} (GB)</label>
+          <label class="form-label">{{ trans.networkInterface }}</label>
+          <input type="text" name="edit_interface" autocomplete="off" v-model.trim="editForm.interface" class="form-input" :placeholder="trans.networkInterfacePlaceholder">
+        </div>
+        <div class="form-group flex-1">
+          <label class="form-label">
+            {{ trans.rxCorrection }} (GB)
+            <HelpTooltip :text="trans.correctionHint" />
+          </label>
           <input type="number" name="edit_rx_correction" autocomplete="off" v-model="editForm.rx_correction" class="form-input" placeholder="0" min="0" step="0.1">
         </div>
         <div class="form-group flex-1">
-          <label class="form-label">{{ trans.txCorrection }} (GB)</label>
+          <label class="form-label">
+            {{ trans.txCorrection }} (GB)
+            <HelpTooltip :text="trans.correctionHint" />
+          </label>
           <input type="number" name="edit_tx_correction" autocomplete="off" v-model="editForm.tx_correction" class="form-input" placeholder="0" min="0" step="0.1">
         </div>
       </div>
@@ -184,12 +211,6 @@
           </div>
         </div>
       </div>
-      <div class="text-muted text-sm mb-3">
-        <span class="warning-icon">[i]</span> {{ trans.collectIntervalHint }}<br>
-        <span class="warning-icon">[i]</span> {{ trans.correctionHint }}<br>
-        <span class="warning-icon">[i]</span> {{ trans.trafficResetDayTip }}
-      </div>
-
       <div class="modal-footer flex-justify-between">
         <button @click="$emit('save')" class="btn btn-primary" :disabled="hasPingNodeErrors">{{ trans.save }}</button>
         <button @click="$emit('close')" class="btn">{{ trans.cancel }}</button>
@@ -200,6 +221,7 @@
 
 <script setup>
 import { computed, watch } from 'vue'
+import HelpTooltip from '../../../components/HelpTooltip.vue'
 import { PING_NODE_FIELDS, validatePingNode } from '../../../utils/pingNode.js'
 import { currentLang } from '../../../utils/i18n.js'
 import { BILLING_CYCLES, CURRENCY_OPTIONS, normalizePrice, renewExpireDateIfNeeded } from '../../../utils/server.js'
@@ -228,6 +250,16 @@ const hasPingNodeErrors = computed(() => Object.values(pingNodeErrors.value).som
 
 const billingCycleOptions = BILLING_CYCLES
 const currencyOptions = CURRENCY_OPTIONS
+const currencySelectOptions = computed(() => {
+  const currentCurrency = String(editForm.value.currency || '').trim()
+  if (!currentCurrency || currencyOptions.some(item => item.symbol === currentCurrency)) {
+    return currencyOptions
+  }
+  return [
+    { symbol: currentCurrency, nameZh: currentCurrency, nameEn: currentCurrency },
+    ...currencyOptions
+  ]
+})
 
 const cycleLabel = (item) => currentLang.value === 'zh' ? item.labelZh : item.labelEn
 const currencyLabel = (item) => currentLang.value === 'zh'
@@ -251,6 +283,7 @@ const hasNodeNotificationOptions = computed(() => (
   !!props.settings.tg_bot_token &&
   isOfflineNotifyEnabled.value
 ))
+const isWssReportEnabled = computed(() => props.settings.wss_report_enabled === true)
 
 const normalizePriceInput = () => {
   editForm.value.price = normalizePrice(editForm.value.price)
@@ -277,6 +310,16 @@ watch(
       editForm.value.expire_date = renewal.expire_date
     }
   }
+)
+
+watch(
+  isWssReportEnabled,
+  (enabled) => {
+    if (!enabled) {
+      editForm.value.connection_mode = 'http'
+    }
+  },
+  { immediate: true }
 )
 
 const emit = defineEmits(['save', 'close', 'toggle-auto-update'])

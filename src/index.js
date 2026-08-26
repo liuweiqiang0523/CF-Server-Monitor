@@ -3,64 +3,30 @@ import { checkOfflineNodes, checkExpiringServers, checkResourceAlerts } from './
 import { updateDatabase } from './database/updateDatabase.js';
 import { handleAdminAPI } from './handlers/admin.js';
 import { serveFrontend } from './handlers/frontend.js';
-import { handleUpdate, handleWebSocketUpgrade } from './handlers/update.js';
+import { handleUpdate, handleWebSocketUpgrade, handleUpdateWebSocketUpgrade } from './handlers/update.js';
 import { handleServerAPI, handleServersAPI } from './handlers/dashboard.js';
 import { handleTheme } from './handlers/theme.js';
-import { loadSettings, loadSiteSettings, loadAppearanceOptions, normalizeLongHistoryPoints, setDebug, debug, getCurrentVersion } from './utils/settings.js';
+import { isValidThemeOptions, loadSettings, loadSiteSettings, loadAppearanceOptions, normalizeFrontendWsTimeoutMinutes, normalizeLongHistoryPoints, saveThemeOptions, setDebug, debug } from './utils/settings.js';
 import { checkAuth, simpleAuthResponse } from './middleware/auth.js';
 import { getServerDetail, getMetricsHistoryCache, setMetricsHistoryCache, getCacheDuration } from './utils/cache.js';
 import { AppError, createSuccessResponse, createUnauthorizedResponse, createBadRequestResponse, createNotFoundResponse, createErrorResponse } from './utils/errors.js';
 import { verifyTurnstileToken } from './utils/common.js';
 import { getCorsAllowedOrigins, createOptionsResponse, applyCors } from './utils/cors.js';
 import { getRemoteVersion } from './utils/version.js';
+import {
+  HISTORY_ALL_QUERY_COLUMNS
+} from './utils/historyFields.js';
+import {
+  CURRENT_VERSION,
+  DASHBOARD_LATENCY_WINDOW_HOURS,
+  DASHBOARD_LATENCY_WINDOW_POINTS
+} from './utils/config.js';
 // Durable Objects: 实时指标广播
 // 显式 import + extends，确保 wrangler 静态分析器能在入口文件直接识别此 DO 类
 import { MetricsBroadcaster as _MetricsBroadcaster }
   from './durable/MetricsBroadcaster.js';
 
 export class MetricsBroadcaster extends _MetricsBroadcaster {}
-
-async function fetchStaticAsset(request, env, path) {
-  if (!env.ASSETS || request.method !== 'GET') return null;
-
-  try {
-    const res = await env.ASSETS.fetch(
-      new Request(`http://static${path}`, request)
-    );
-
-    if (!res.ok) return null;
-
-    const headers = new Headers(res.headers);
-
-    headers.set(
-      'Cache-Control',
-      'public, max-age=31536000, immutable'
-    );
-
-    return new Response(res.body, {
-      status: res.status,
-      statusText: res.statusText,
-      headers
-    });
-
-  } catch (_) {
-    return null;
-  }
-}
-
-function isAdminAssetReferrer(request) {
-  const referrer = request.headers.get('Referer') || request.headers.get('Referrer') || '';
-  if (!referrer) return false;
-
-  try {
-    const requestUrl = new URL(request.url);
-    const referrerUrl = new URL(referrer);
-    return referrerUrl.origin === requestUrl.origin &&
-      (referrerUrl.pathname === '/admin' || referrerUrl.pathname.startsWith('/admin/'));
-  } catch (_) {
-    return false;
-  }
-}
 
 function cleanThemeAssetResponse(response) {
   const headers = new Headers(response.headers);
@@ -228,13 +194,6 @@ export default {
     }
 
     if (method === 'GET' && path.startsWith('/assets/')) {
-      if (isAdminAssetReferrer(request)) {
-        const staticAssetResponse = await fetchStaticAsset(request, env, path);
-        if (staticAssetResponse) {
-          return applyCors(staticAssetResponse, request, corsAllowedOrigins);
-        }
-      }
-
       try {
         const themeAssetResponse = await serveFrontend(request, env, await loadSettings(env.DB));
         if (themeAssetResponse.headers.get('X-CFSM-Theme-Asset') === '1') {
@@ -244,20 +203,13 @@ export default {
       }
     }
 
-    if (env.ASSETS && method === 'GET') {
-      const staticAssetResponse = await fetchStaticAsset(request, env, path);
-      if (staticAssetResponse) {
-        return applyCors(staticAssetResponse, request, corsAllowedOrigins);
-      }
-    }
-
     const bypassTurnstilePaths = [
       '/admin/api',
       '/api/ws',
     ];
 
     const isApiRequest = path.startsWith('/api/') || path.startsWith('/admin/api');
-    if (path === '/api/config' || path === '/clearHistory') {
+    if (path === '/api/config' || path === '/api/theme_options' || path === '/clearHistory') {
       await initDatabase(env.DB);
     }
 
@@ -310,6 +262,7 @@ export default {
 
     const routes = [
       { method: 'POST', path: '/update', handler: () => handleUpdate(request, env, ctx) },
+      { method: 'GET', path: '/update', handler: () => handleUpdateWebSocketUpgrade(request, env) },
       { method: 'GET', path: '/__do/health', handler: async () => {
         if (!env.METRICS_BROADCASTER) {
           return createSuccessResponse({ ok: false, reason: 'DO not bound' });
@@ -344,7 +297,7 @@ export default {
         const remoteVersion = isLoggedIn ? await getRemoteVersion() : null;
 
         return createSuccessResponse({
-          version: getCurrentVersion(),
+          version: CURRENT_VERSION,
           ...(isLoggedIn ? {
             last_workers_version: remoteVersion?.workers || null,
             last_agent_version: remoteVersion?.agent || null
@@ -359,12 +312,56 @@ export default {
           theme_options: appearanceOptions.theme_options || {},
           verified: verified,
           turnstile_verified: turnstileVerified,
-          long_history_points: Number(normalizeLongHistoryPoints(sys.long_history_points))
+          frontend_ws_timeout_minutes: Number(normalizeFrontendWsTimeoutMinutes(sys.frontend_ws_timeout_minutes)),
+          long_history_points: Number(normalizeLongHistoryPoints(sys.long_history_points)),
+          latency_window: {
+            points: DASHBOARD_LATENCY_WINDOW_POINTS,
+            hours: DASHBOARD_LATENCY_WINDOW_HOURS
+          }
         });
       }},
       { method: 'GET', path: '/theme', handler: async () => {
-        const themeStore = await handleTheme()
-        return createSuccessResponse(themeStore)
+        const themeResult = await handleTheme()
+        if (!themeResult.ok) {
+          return new Response(JSON.stringify({
+            error: themeResult.error || 'themeStoreProxyFailed',
+            code: 502,
+            fallback: 'client'
+          }), {
+            status: 502,
+            headers: { 'Content-Type': 'application/json' }
+          })
+        }
+
+        return createSuccessResponse(themeResult.themeStore, {
+          'X-CFSM-Theme-Source': themeResult.cached ? 'cache' : 'raw'
+        })
+      }},
+      { method: 'POST', path: '/api/theme_options', handler: async () => {
+        await ensureSiteSettings();
+        if (!await checkAuth(request, env, sys)) {
+          return simpleAuthResponse();
+        }
+
+        let data;
+        try {
+          data = await request.json();
+        } catch (_) {
+          return createBadRequestResponse('invalidJson');
+        }
+
+        const themeOptions = data?.theme_options;
+        if (!isValidThemeOptions(themeOptions)) {
+          return createBadRequestResponse('invalidThemeOptionsFormat');
+        }
+
+        await saveThemeOptions(env.DB, themeOptions);
+        sys.theme_options = themeOptions;
+        return createSuccessResponse({
+          success: true,
+          theme_options: themeOptions,
+          message: 'updateSuccess'
+        });
       }},
       { method: 'GET', path: '/api/server', handler: async () => {
         await ensureSiteSettings();
@@ -380,13 +377,13 @@ export default {
         await ensureSiteSettings();
         const id = url.searchParams.get('id');
         const hours = parseFloat(url.searchParams.get('hours') || '24');
-        const allColumns = 'cpu, gpu_info, ram_total, ram_used, disk_total, disk_used, disk_read_bps, disk_write_bps, disk_read_iops, disk_write_iops, disk_await_ms, disk_util, processes, net_in_speed, net_out_speed, tcp_conn, udp_conn, ping_ct, ping_cu, ping_cm, ping_bd, loss_ct, loss_cu, loss_cm, loss_bd, swap_total, swap_used, load_avg, region, kernel_version';
+        const allColumns = HISTORY_ALL_QUERY_COLUMNS.join(', ');
         // 后续版本可以删掉region 字段，用于升级数据库提示
         return fetchHistoryData(env, request, id, hours, allColumns, sys);
       }},
       { method: 'POST', path: '/admin/api', handler: async () => {
         await ensureSiteSettings();
-        return handleAdminAPI(request, env, sys, ensureFullSettings);
+        return handleAdminAPI(request, env, sys, ensureFullSettings, ctx);
       }},
       { method: 'POST', path: '/updateDatabase', handler: async () => {
         await ensureSiteSettings();
@@ -467,12 +464,8 @@ export default {
         await weeklyCleanup(env.DB);
         debug('[Cron] 每周数据清理任务完成');
       }
-      
-      if (hour === 12) {
-        debug('[Cron] 开始执行服务器到期检测');
-        await checkExpiringServers(env.DB);
-        debug('[Cron] 服务器到期检测完成');
-      }
+      debug('[Cron] 检查是否到达服务器到期检测时间');
+      await checkExpiringServers(env.DB, { scheduled: true, now: now.getTime() });
     }else if(env.DEBUG == 1){
       if (cron === '0 0 * * 0') {
         debug('[Cron DEBUG] 开始执行每周数据清理任务（表轮换）');
