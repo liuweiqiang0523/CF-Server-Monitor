@@ -39,12 +39,17 @@ import {
   toBroadcastSamples
 } from '../handlers/update.js';
 import {
+  applyClientIpFallback,
+  resolveClientIpFromRequest
+} from '../utils/metrics.js';
+import {
   AGENT_DEFAULT_HISTORY_WRITE_INTERVAL_MS,
   AGENT_MIN_IDLE_WSS_REPORT_INTERVAL_MS,
   AGENT_SERVER_DETAIL_TTL_MS,
   AGENT_WSS_FRONTEND_BATCH_WINDOW_MS,
   LATEST_REPORT_CACHE_MAX_SERVERS,
   LATEST_REPORT_CACHE_TTL_MS,
+  RESOURCE_ALERT_COMPACT_RESULT_FORMAT,
   UPDATE_MAX_BATCH_SAMPLES,
   UPDATE_MAX_REQUEST_BYTES
 } from '../utils/config.js';
@@ -172,6 +177,12 @@ function maskPublicIpUpdate(update) {
   };
 }
 
+// 连接数缺失时必须保持 null：兜底成 0 会让不报该字段的旧 agent 被判为“已恢复”。
+function toOptionalCount(value) {
+  if (value === undefined || value === null || value === '') return null;
+  return toFiniteNumber(value);
+}
+
 function normalizeResourceAlertSample(sample) {
   if (!sample || typeof sample !== 'object') {
     return null;
@@ -197,6 +208,8 @@ function normalizeResourceAlertSample(sample) {
     : null;
   const netIn = Math.max(0, toFiniteNumber(metrics.net_in_speed) ?? 0);
   const netOut = Math.max(0, toFiniteNumber(metrics.net_out_speed) ?? 0);
+  const tcpConn = toOptionalCount(metrics.tcp_conn);
+  const udpConn = toOptionalCount(metrics.udp_conn);
 
   return {
     ts,
@@ -206,7 +219,9 @@ function normalizeResourceAlertSample(sample) {
     disk,
     netIn,
     netOut,
-    netTotal: netIn + netOut
+    netTotal: netIn + netOut,
+    tcpConn,
+    udpConn
   };
 }
 
@@ -222,7 +237,9 @@ function normalizeThresholds(thresholds = {}) {
     disk: normalize(thresholds.diskPercent),
     netIn: normalize(thresholds.netInBps),
     netOut: normalize(thresholds.netOutBps),
-    netTotal: normalize(thresholds.netTotalBps)
+    netTotal: normalize(thresholds.netTotalBps),
+    tcpConn: normalize(thresholds.tcpConn),
+    udpConn: normalize(thresholds.udpConn)
   };
 }
 
@@ -833,7 +850,10 @@ export class MetricsBroadcaster {
       const ack = {
         config_schema: schemaVersion,
         config_md5: descriptor.md5,
-        has_config: md5Changed || hasCorrection
+        has_config: md5Changed || hasCorrection,
+        // 自定义 UA 独立下发：不参与 md5；只有本次 ack 携带配置协商字段时才有该字段，
+        // agent 收到后自行比对，值相同不写盘。
+        ua: descriptor.ua
       };
 
       if (ack.has_config) {
@@ -1274,7 +1294,12 @@ export class MetricsBroadcaster {
     delete state.pendingHistoryAggregate;
     this.agentHistoryWrites.set(serverId, state);
     try {
-      const metrics = applyHistoryMetricAggregates(payload.metrics, aggregateForWrite);
+      // 探针没探到公网 IP 时用握手连接的来源 IP 按地址族补位。
+      // 只在真正落库的这一帧执行，避免每帧上报都做判空/正则。
+      const metrics = applyClientIpFallback(
+        applyHistoryMetricAggregates(payload.metrics, aggregateForWrite),
+        attachment.clientIp
+      );
       await saveMetricsHistory(
         this.env.DB,
         serverId,
@@ -1471,6 +1496,9 @@ export class MetricsBroadcaster {
       historyPartitionId: 0,
       region: request.headers.get('cf-ipcountry') || '',
       agentVersion: normalizeAgentVersion(request.headers.get('X-Agent-Version')),
+      // 握手请求头里的来源 IP 随连接保存：后续帧上报无法再拿到握手头，
+      // 探针公网 IP 为空时用它按地址族补位。
+      clientIp: resolveClientIpFromRequest(request),
       reportIntervalMs: AGENT_DEFAULT_HISTORY_WRITE_INTERVAL_MS,
       wssReportIntervalMs: DEFAULT_WSS_REPORT_INTERVAL * 1000,
       wssScheduleCheckAfter: nextHour.getTime(),
@@ -1729,7 +1757,9 @@ export class MetricsBroadcaster {
 
       this._activateResourceAlertCache();
       await this._ensureResourceAlertSnapshotLoaded();
-      const result = await this._evaluateResourceAlertRules(normalizedRules.rules);
+      const result = await this._evaluateResourceAlertRules(normalizedRules.rules, {
+        resultFormat: body?.resultFormat
+      });
 
       return new Response(JSON.stringify(result), {
         headers: {
@@ -1936,7 +1966,8 @@ export class MetricsBroadcaster {
     }
   }
 
-  _evaluateResourceAlertRule(rule = {}, now = Date.now()) {
+  _evaluateResourceAlertRule(rule = {}, now = Date.now(), options = {}) {
+    const compact = options.resultFormat === RESOURCE_ALERT_COMPACT_RESULT_FORMAT;
     const windowMinutesNumber = Number(rule.windowMinutes);
     const windowMinutes = Number.isInteger(windowMinutesNumber)
       ? Math.max(5, Math.min(10, windowMinutesNumber))
@@ -1950,7 +1981,9 @@ export class MetricsBroadcaster {
       ['disk', thresholds.disk],
       ['netIn', thresholds.netIn],
       ['netOut', thresholds.netOut],
-      ['netTotal', thresholds.netTotal]
+      ['netTotal', thresholds.netTotal],
+      ['tcpConn', thresholds.tcpConn],
+      ['udpConn', thresholds.udpConn]
     ].filter(([, threshold]) => threshold > 0);
 
     const alerts = [];
@@ -1991,31 +2024,39 @@ export class MetricsBroadcaster {
           ? triggerValue > threshold
           : metricSamples.every(item => item.value > threshold);
 
-        const metricEvaluation = {
-          metric,
-          mode,
-          threshold,
-          triggerValue,
-          triggered: isTriggered,
-          ...summary
-        };
-        evaluationMetrics.push(metricEvaluation);
-        if (isTriggered) {
-          metrics.push(metricEvaluation);
+        if (compact && !isTriggered) {
+          // compact-v1：规则级定义只返回一次，节点仅返回 triggerValue/current/min/max/avg。
+          evaluationMetrics.push([triggerValue, summary.current, summary.min, summary.max, summary.avg]);
+        } else {
+          const metricEvaluation = {
+            metric,
+            mode,
+            threshold,
+            triggerValue,
+            triggered: isTriggered,
+            ...summary
+          };
+          evaluationMetrics.push(metricEvaluation);
+          if (isTriggered) metrics.push(metricEvaluation);
         }
       }
 
       if (!canEvaluateAllMetrics) continue;
-      evaluatedServerIds.push(serverId);
-      evaluations.push({
-        serverId,
-        mode,
-        windowMinutes,
-        sampleCount: samples.length,
-        minSampleRatio: RESOURCE_ALERT_MIN_SAMPLE_RATIO,
-        latestTs: latestSample.ts,
-        metrics: evaluationMetrics
-      });
+      if (compact) {
+        // 告警节点保留完整 alerts 即可；只有未触发节点才可能需要恢复判断。
+        if (metrics.length === 0) evaluations.push({ serverId, metrics: evaluationMetrics });
+      } else {
+        evaluatedServerIds.push(serverId);
+        evaluations.push({
+          serverId,
+          mode,
+          windowMinutes,
+          sampleCount: samples.length,
+          minSampleRatio: RESOURCE_ALERT_MIN_SAMPLE_RATIO,
+          latestTs: latestSample.ts,
+          metrics: evaluationMetrics
+        });
+      }
 
       if (metrics.length > 0) {
         alerts.push({
@@ -2030,16 +2071,27 @@ export class MetricsBroadcaster {
       }
     }
 
+    if (compact && (alerts.length > 0 || evaluations.length > 0)) {
+      return {
+        ruleId: rule.ruleId,
+        format: RESOURCE_ALERT_COMPACT_RESULT_FORMAT,
+        metricDefinitions: evaluations.length > 0
+          ? metricThresholds.map(([metric, threshold]) => ({ metric, mode, threshold }))
+          : [],
+        alerts,
+        evaluations
+      };
+    }
     return { ruleId: rule.ruleId, now, mode, windowMinutes, alerts, evaluatedServerIds, evaluations };
   }
 
-  async _evaluateResourceAlertRules(rules = []) {
+  async _evaluateResourceAlertRules(rules = [], options = {}) {
     const now = Date.now();
     this._pruneResourceAlertWindows(now);
     const results = [];
 
     for (const rule of rules) {
-      results.push(this._evaluateResourceAlertRule(rule, now));
+      results.push(this._evaluateResourceAlertRule(rule, now, options));
     }
 
     await this._persistResourceAlertSnapshotIfNeeded(now);

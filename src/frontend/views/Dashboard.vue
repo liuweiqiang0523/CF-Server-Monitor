@@ -122,18 +122,24 @@
       <div class="stat-item">
         <div class="stat-label">{{ trans.servers }}</div>
         <div class="stat-main-value stat-main-value-sm stat-sub-info">
-          <span class="stat-online-color">{{ trans.online }}:{{ stats.online }}</span> |
+          <span class="stat-online-color">{{ trans.online }}:{{ stats.online }}</span>
+          <span class="stat-sep">|</span>
           <span class="stat-offline-color">{{ trans.offline }}:{{ stats.offline }}</span>
         </div>
       </div>
       <div class="stat-item">
         <div class="stat-label">{{ trans.totalTraffic }}</div>
-        <div class="stat-main-value stat-main-value-sm">{{ formatBytes(stats.globalNetRx) }} ↓ | ↑ {{ formatBytes(stats.globalNetTx) }}</div>
+        <div class="stat-main-value stat-main-value-sm">
+          <span>↓ {{ formatBytes(stats.globalNetRx) }}</span>
+          <span class="stat-sep">|</span>
+          <span>↑ {{ formatBytes(stats.globalNetTx) }}</span>
+        </div>
       </div>
-      <div class="stat-item">
+      <div class="stat-item" :class="{ 'stat-item-full': !sysConfig.show_price }">
         <div class="stat-label">{{ trans.realtimeSpeed }}</div>
         <div class="stat-main-value stat-main-value-sm">
-          <span class="stat-net-down-color">↓ {{ formatBytes(stats.globalSpeedIn) }}/s</span> |
+          <span class="stat-net-down-color">↓ {{ formatBytes(stats.globalSpeedIn) }}/s</span>
+          <span class="stat-sep">|</span>
           <span class="stat-net-up-color">↑ {{ formatBytes(stats.globalSpeedOut) }}/s</span>
         </div>
       </div>
@@ -407,6 +413,10 @@ const sysConfig = ref({
   custom_cu_name: appConfig?.custom_cu_name || '联通',
   custom_cm_name: appConfig?.custom_cm_name || '移动',
   custom_bd_name: appConfig?.custom_bd_name || 'BGP',
+  node_1_name: appConfig?.node_1_name || 'Node 1',
+  node_2_name: appConfig?.node_2_name || 'Node 2',
+  node_3_name: appConfig?.node_3_name || 'Node 3',
+  node_4_name: appConfig?.node_4_name || 'Node 4',
   frontend_ws_timeout_minutes: normalizeLiveSocketTimeoutMinutes(appConfig?.frontend_ws_timeout_minutes),
   display_mode: 'bar',
   site_title: DEFAULT_SITE_TITLE,
@@ -1004,6 +1014,10 @@ const refreshData = async () => {
           custom_cu_name: data.sysConfig?.custom_cu_name || sysConfig.value.custom_cu_name,
           custom_cm_name: data.sysConfig?.custom_cm_name || sysConfig.value.custom_cm_name,
           custom_bd_name: data.sysConfig?.custom_bd_name || sysConfig.value.custom_bd_name,
+          node_1_name: data.sysConfig?.node_1_name || sysConfig.value.node_1_name,
+          node_2_name: data.sysConfig?.node_2_name || sysConfig.value.node_2_name,
+          node_3_name: data.sysConfig?.node_3_name || sysConfig.value.node_3_name,
+          node_4_name: data.sysConfig?.node_4_name || sysConfig.value.node_4_name,
           frontend_ws_timeout_minutes: sysConfig.value.frontend_ws_timeout_minutes,
           display_mode: normalizeDisplayMode(data.sysConfig?.display_mode),
           site_title: sysConfig.value.site_title || DEFAULT_SITE_TITLE,
@@ -1047,6 +1061,10 @@ const refreshData = async () => {
       custom_cu_name: data.sysConfig?.custom_cu_name || sysConfig.value.custom_cu_name,
       custom_cm_name: data.sysConfig?.custom_cm_name || sysConfig.value.custom_cm_name,
       custom_bd_name: data.sysConfig?.custom_bd_name || sysConfig.value.custom_bd_name,
+      node_1_name: data.sysConfig?.node_1_name || sysConfig.value.node_1_name,
+      node_2_name: data.sysConfig?.node_2_name || sysConfig.value.node_2_name,
+      node_3_name: data.sysConfig?.node_3_name || sysConfig.value.node_3_name,
+      node_4_name: data.sysConfig?.node_4_name || sysConfig.value.node_4_name,
       frontend_ws_timeout_minutes: sysConfig.value.frontend_ws_timeout_minutes,
       display_mode: normalizeDisplayMode(data.sysConfig?.display_mode),
       site_title: sysConfig.value.site_title || DEFAULT_SITE_TITLE,

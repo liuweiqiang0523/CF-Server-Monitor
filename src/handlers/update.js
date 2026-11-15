@@ -5,7 +5,8 @@ import {
   DISK_IO_FIELD_TO_COLUMN,
   DISK_IO_METRIC_FIELDS,
   mergeMetricsIntoServer,
-  coerceNumericMetricFields
+  coerceNumericMetricFields,
+  applyRequestIpFallback
 } from '../utils/metrics.js';
 import { createErrorResponse, createUnauthorizedResponse, createBadRequestResponse } from '../utils/errors.js';
 import { ensureServerOptimization } from '../database/indexOptimization.js';
@@ -15,10 +16,11 @@ import {
   hasRecentFrontendRealtimeActivity,
   markFrontendRealtimeActive
 } from '../utils/realtimeBroadcastGate.js';
-import { checkWebSocketAuth } from '../middleware/auth.js';
+import { checkWebSocketAuth, hasAppPasswordAccess } from '../middleware/auth.js';
 import {
   AGENT_CONFIG_MD5_HEADER,
   AGENT_CONFIG_SCHEMA_HEADER,
+  AGENT_UA_HEADER,
   describeAgentConfig,
   isValidTrafficCorrection,
   normalizeAgentConfigSchemaVersion,
@@ -29,6 +31,13 @@ import {
   BROADCAST_DELETE_FIELDS,
   HISTORY_METRIC_AGGREGATION_POLICY
 } from '../utils/historyFields.js';
+import {
+  AUTO_DISCOVERY_MODE_REUSED,
+  AUTO_DISCOVERY_STATUS_HEADER,
+  AUTO_DISCOVERY_SERVER_ID_HEADER,
+  discoverServer,
+  isAutoDiscoveryEnabled
+} from '../utils/autoDiscovery.js';
 import {
   UPDATE_FRONTEND_SUBSCRIBER_CHECK_INTERVAL_MS,
   UPDATE_MAX_BATCH_SAMPLES,
@@ -558,7 +567,41 @@ function _ensureBatchFlush(env) {
   return flushingPromise;
 }
 
+// 自动建号的结果通过响应头回传，因此需要包一层统一补头，
+// 避免在 handleUpdateCore 的多个 return 分支里重复处理。
 export async function handleUpdate(request, env, ctx) {
+  const discovery = { mode: '', code: '', id: '' };
+  // authState 只在 secret 校验通过后置 ok，ua 复用核心流程里已加载的 settings，不额外查库。
+  const authState = { ok: false, ua: '' };
+  const response = await handleUpdateCore(request, env, ctx, discovery, authState);
+
+  // 自定义 UA 只下发给已认证且本次请求成功的 agent，401/400/404 一律不带，避免暴露。
+  const attachUa = authState.ok && authState.ua && response.ok;
+  if (!discovery.mode && !attachUa) return response;
+
+  const headers = new Headers(response.headers);
+  if (attachUa) {
+    headers.set(AGENT_UA_HEADER, authState.ua);
+    headers.set('Cache-Control', 'no-store');
+  }
+  if (discovery.mode) {
+    headers.set(
+      AUTO_DISCOVERY_STATUS_HEADER,
+      discovery.code ? `${discovery.mode}:${discovery.code}` : discovery.mode
+    );
+    if (discovery.id) {
+      headers.set(AUTO_DISCOVERY_SERVER_ID_HEADER, discovery.id);
+    }
+  }
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
+}
+
+async function handleUpdateCore(request, env, ctx, discovery, authState = null) {
   try {
     // 必须在 request.json() 之前：超大 body 的解析本身就可能耗尽 Worker CPU。
     // 注意这是防呆而非硬上限：chunked 或缺少 Content-Length 的请求会跳过该检查。
@@ -572,20 +615,83 @@ export async function handleUpdate(request, env, ctx) {
     }
 
     const data = await request.json();
-    const { id, secret } = data;
+    const { id: requestedId, secret } = data;
 
     if (secret !== env.API_SECRET) {
       return createUnauthorizedResponse('Invalid secret');
     }
+    if (authState) authState.ok = true;
 
     let regionCode = request.cf?.country || request.headers?.get('cf-ipcountry') || '';
     const agentVersion = normalizeAgentVersion(request.headers.get('X-Agent-Version'));
 
-    const serverDetail = await getServerDetail(env.DB, id, true);
+    const normalizedRequestId = typeof requestedId === 'string' ? requestedId.trim() : '';
+    let serverDetail = normalizedRequestId
+      ? await getServerDetail(env.DB, normalizedRequestId, true)
+      : null;
+
+    // 仅在 id 为空时尝试自动建号：已有 id 但查不到仍走 404，避免删除后被自动复活。
+    if (!serverDetail && !normalizedRequestId) {
+      // 建号前先做与服务器无关的载荷校验：否则会先 INSERT 出一行空壳，
+      // 随后返回 400，库里留下一条永远不会被写入数据的服务器。
+      if (normalizeMetricSamples(data).length === 0) {
+        logUpdateBadRequest('Missing metrics', {
+          id: '',
+          has_metrics: !!data.metrics,
+          has_samples: Array.isArray(data.samples),
+          has_batch: Array.isArray(data.batch)
+        });
+        return createBadRequestResponse('Missing metrics');
+      }
+      if (
+        (Object.prototype.hasOwnProperty.call(data, 'rx_correction') ||
+          Object.prototype.hasOwnProperty.call(data, 'tx_correction')) &&
+        (normalizeCorrectionValue(data.rx_correction) === null ||
+          normalizeCorrectionValue(data.tx_correction) === null)
+      ) {
+        return createBadRequestResponse('Invalid correction');
+      }
+      const settings = await loadSiteSettings(env.DB);
+      if (authState) authState.ua = settings.ua;
+      if (isAutoDiscoveryEnabled(settings)) {
+        const result = await discoverServer(env, {
+          name: data.name,
+          metrics: data.metrics,
+          request
+        });
+
+        discovery.mode = result.mode;
+        discovery.code = result.code;
+
+        // 同名服务器已存在时拒绝本次写入：不建号、不落库、不回传已有 id。
+        // 无 name 时名称取 CF-Connecting-IP，NAT/同出口下极易撞名，复用会把两台机器的数据混在一起。
+        if (result.mode === AUTO_DISCOVERY_MODE_REUSED) {
+          return createServerNotFoundResponse();
+        }
+
+        if (result.id) {
+          // 建号已经成功，id 必须先记下来：即使随后读详情失败，也要通过响应头回传，
+          // 否则 Agent 下次上报仍是空 id，只会撞到同名服务器（reused）然后退出。
+          discovery.id = result.id;
+          clearServerDetailCache();
+          try {
+            serverDetail = await getServerDetail(env.DB, result.id, true);
+          } catch (e) {
+            console.warn('[AutoDiscovery] reload failed after create', {
+              id: result.id,
+              error: e?.message || e
+            });
+            serverDetail = null;
+          }
+        }
+      }
+    }
 
     if (!serverDetail) {
       return createServerNotFoundResponse();
     }
+
+    const id = serverDetail.id;
 
     if (
       Object.prototype.hasOwnProperty.call(data, 'rx_correction') ||
@@ -639,7 +745,9 @@ export async function handleUpdate(request, env, ctx) {
     // 获取最后一条插入（如果是批量数据，取最后一个样本）
     const latestSample = samples[samples.length - 1];
     const latestMetrics = getReportMetrics(data, latestSample);
-    const historyMetrics = getHistoryMetrics(data, samples, latestSample);
+    // 探针没探到公网 IP（ip_v4/ip_v6 均为空或 "0"）时，用本次连接的来源 IP 补位，
+    // 按地址族写入对应字段；只作用于落库的指标，广播 payload 本就不含 ip 字段。
+    const historyMetrics = applyRequestIpFallback(getHistoryMetrics(data, samples, latestSample), request);
     await saveMetricsHistory(
       env.DB,
       id,
@@ -670,6 +778,7 @@ export async function handleUpdate(request, env, ctx) {
 
     try {
       const settings = await loadSiteSettings(env.DB);
+      if (authState) authState.ua = settings.ua;
       const wssStateHeaders = buildAgentWssStateHeaders(settings);
       const descriptor = await describeAgentConfig(serverDetail, settings, clientConfigSchema);
       const clientConfigMd5 = (request.headers.get(AGENT_CONFIG_MD5_HEADER) || '').trim().toLowerCase();
@@ -756,7 +865,11 @@ async function forwardWebSocketUpgrade(request, env, internalPath, logPrefix) {
 
 export async function handleWebSocketUpgrade(request, env) {
   const settings = await loadSiteSettings(env.DB, { forceRefresh: true });
-  if (settings?.is_public !== 'true' && !await checkWebSocketAuth(request, env, settings)) {
+  // 私有站点的实时订阅：登录态或第三方 App 口令任一通过即可。
+  const authorized = settings?.is_public === 'true'
+    || await checkWebSocketAuth(request, env, settings)
+    || hasAppPasswordAccess(request, settings);
+  if (!authorized) {
     return new Response(JSON.stringify({ error: 'Unauthorized', code: 401 }), {
       status: 401,
       headers: { 'Content-Type': 'application/json' }
