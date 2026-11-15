@@ -2,8 +2,6 @@ name: Sync upstream (daily)
 
 on:
   schedule:
-    # GitHub Actions uses UTC. Run a little after the hour to avoid the
-    # busiest minute of the shared scheduler.
     - cron: "17 0 * * *"
   workflow_dispatch:
 
@@ -13,88 +11,54 @@ concurrency:
 
 jobs:
   sync:
-    # Do not push to the upstream repository if this workflow is copied there.
-    if: ${{ github.event.repository.fork == true }}
+    if: ${{ github.repository == 'liuweiqiang0523/CF-Server-Monitor' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: write
       actions: write
-
     steps:
       - name: Checkout fork
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
-          persist-credentials: true
 
       - name: Configure Git
-        shell: bash
         run: |
-          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Merge latest upstream main
+      - name: Prepare upstream merge
         id: sync
-        shell: bash
+        run: bash scripts/sync-upstream.sh
+
+      - name: Setup Node.js
+        if: steps.sync.outputs.changed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Validate merged code before publishing
+        if: steps.sync.outputs.changed == 'true'
         run: |
-          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npm run test:all
+          node --test test/upstream-sync.test.js
+          npm run build:frontend
 
-          upstream_url="https://github.com/huilang-me/CF-Server-Monitor.git"
-          git remote add upstream "$upstream_url"
-          git fetch --no-tags --prune upstream main
+      - name: Publish validated merge
+        if: steps.sync.outputs.changed == 'true'
+        run: git push origin HEAD:main
 
-          fork_before="$(git rev-parse HEAD)"
-          upstream_commit="$(git rev-parse refs/remotes/upstream/main)"
-
-          # If upstream is already contained in the fork, there is nothing to do.
-          if git merge-base --is-ancestor "$upstream_commit" HEAD; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Fork already contains upstream $upstream_commit."
-            exit 0
-          fi
-
-          # Fast-forward when the fork has no divergent commits. Otherwise keep
-          # fork-specific commits by creating a normal merge commit.
-          if git merge-base --is-ancestor HEAD "$upstream_commit"; then
-            git merge --ff-only "$upstream_commit"
-          else
-            if ! git merge --no-edit --no-ff "$upstream_commit"; then
-              git merge --abort || true
-              echo "::error title=Upstream sync conflict::Fork-specific changes conflict with upstream main. Resolve the merge manually, then rerun this workflow."
-              exit 1
-            fi
-          fi
-
-          fork_after="$(git rev-parse HEAD)"
-          git push origin HEAD:main
-
-          {
-            echo "changed=true"
-            echo "before=$fork_before"
-            echo "after=$fork_after"
-          } >> "$GITHUB_OUTPUT"
-
-          echo "Synced upstream $upstream_commit"
-          echo "Fork moved from $fork_before to $fork_after"
-
-      - name: Trigger Cloudflare deployment when configured
-        if: ${{ steps.sync.outputs.changed == 'true' }}
+      - name: Deploy current main or recover an unsuccessful deployment
         env:
           GH_TOKEN: ${{ github.token }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -z "$CF_ACCOUNT_ID" ]]; then
-            echo "CF_ACCOUNT_ID is not configured; assuming Cloudflare Git integration will deploy the pushed main branch."
-            exit 0
-          fi
+        run: bash scripts/deploy-synced-main.sh
 
-          # A push made with GITHUB_TOKEN does not start another workflow. Use
-          # workflow_dispatch explicitly so deploy.yml runs when Action secrets
-          # are configured.
-          gh workflow run deploy.yml --repo "$GITHUB_REPOSITORY" --ref main
-          echo "Triggered deploy.yml for main."
+      - name: Record failure
+        if: failure()
+        run: |
+          echo 'Sync or deployment failed. Review the failed step; the next run retries deployment if code was already synced.' >> "$GITHUB_STEP_SUMMARY"

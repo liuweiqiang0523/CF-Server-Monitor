@@ -35,6 +35,8 @@ class FakeWebSocket {
 
 test('frontend WebSocket closes at its lifetime limit without reconnecting', async () => {
   const vite = await createServer({
+    // This SSR unit test needs no dev HTTPS certificate or system trust changes.
+    configFile: false,
     appType: 'custom',
     logLevel: 'silent',
     server: { middlewareMode: true }
